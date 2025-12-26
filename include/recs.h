@@ -191,35 +191,18 @@ public:
     // Entity management
     // --------------------------------------------------------
     Entity create() {
-        uint32_t id;
-        if (!free_ids_.empty()) {
-            id = free_ids_.back();
-            free_ids_.pop_back();
-        } else {
-            id = (uint32_t)generations_.size();
-            generations_.push_back(0);
-        }
-
-        Entity e{id, generations_[id]};
-        if (entity_locations_.size() <= id)
-            entity_locations_.resize(id + 1);
-        entity_locations_[id] = {nullptr, 0};
-        return e;
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        return create_unsafe();
     }
 
     void destroy(Entity e) {
-        if (!alive(e)) return;
-
-        auto& loc = entity_locations_[e.id];
-        remove_from_archetype(e, *loc.arch, loc.index);
-
-        generations_[e.id]++;
-        free_ids_.push_back(e.id);
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        destroy_unsafe(e);
     }
 
     bool alive(Entity e) const {
-        return e.id < generations_.size() &&
-               generations_[e.id] == e.generation;
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        return alive_unsafe(e);
     }
 
     // --------------------------------------------------------
@@ -227,19 +210,22 @@ public:
     // --------------------------------------------------------
     template<typename... Cs>
     void add(Entity e) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         migrate<Cs...>(e, true);
     }
 
     template<typename C, typename... Args>
     void add(Entity e, Args&&... args) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         migrate<C>(e, true);
-        if (auto* comp = get<C>(e)) {
+        if (auto* comp = get_unsafe<C>(e)) {
             *comp = C{std::forward<Args>(args)...};
         }
     }
 
     template<typename... Cs>
     void remove(Entity e) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         migrate<Cs...>(e, false);
     }
 
@@ -248,25 +234,20 @@ public:
     // --------------------------------------------------------
     template<typename C>
     C* get(Entity e) {
-        if (!alive(e)) return nullptr;
-        auto& loc = entity_locations_[e.id];
-        if (!loc.arch) return nullptr;
-        if (!loc.arch->key.has(component_id<C>())) return nullptr;
-        return &(*get_array<C>(*loc.arch))[loc.index];
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        return get_unsafe<C>(e);
     }
 
     template<typename C>
     const C* get(Entity e) const {
-        if (!alive(e)) return nullptr;
-        auto& loc = entity_locations_[e.id];
-        if (!loc.arch) return nullptr;
-        if (!loc.arch->key.has(component_id<C>())) return nullptr;
-        return &(*get_array<C>(*loc.arch))[loc.index];
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        return get_unsafe<C>(e);
     }
 
     template<typename C>
     bool has(Entity e) const {
-        if (!alive(e)) return false;
+        std::lock_guard<std::mutex> lock(world_mutex_);
+        if (!alive_unsafe(e)) return false;
         auto& loc = entity_locations_[e.id];
         if (!loc.arch) return false;
         return loc.arch->key.has(component_id<C>());
@@ -353,6 +334,81 @@ public:
     }
 
     // --------------------------------------------------------
+    // Parallel iteration (thread-safe)
+    // --------------------------------------------------------
+    template<typename... Cs, typename Fn>
+    void parallel_for_each(Fn&& fn) {
+        // Collect matching archetypes with lock
+        std::vector<std::pair<Archetype*, size_t>> work_items;
+        {
+            std::lock_guard<std::mutex> lock(world_mutex_);
+            ArchetypeKey required;
+            (required.add(component_id<Cs>()), ...);
+
+            for (auto& [_, arch] : archetypes_) {
+                if ((arch.key.mask & required.mask) == required.mask) {
+                    size_t n = arch.entities.size();
+                    if (n > 0) {
+                        work_items.emplace_back(&arch, n);
+                    }
+                }
+            }
+        }
+        // Lock released - now safe to parallelize reads
+
+        // Parallelize across all entities in all archetypes
+        for (auto& [arch, count] : work_items) {
+            #pragma omp parallel for schedule(dynamic, 1000)
+            for (size_t i = 0; i < count; ++i) {
+                fn(
+                    (*get_array<Cs>(*arch))[i]...
+                );
+            }
+        }
+    }
+
+    template<typename... Cs, typename Fn>
+    void parallel_for_each_chunk(Fn&& fn) {
+        // Collect matching archetypes and subdivide into chunks
+        struct ChunkWork {
+            Archetype* arch;
+            size_t start;
+            size_t count;
+        };
+        std::vector<ChunkWork> chunks;
+        
+        {
+            std::lock_guard<std::mutex> lock(world_mutex_);
+            ArchetypeKey required;
+            (required.add(component_id<Cs>()), ...);
+
+            for (auto& [_, arch] : archetypes_) {
+                if ((arch.key.mask & required.mask) == required.mask && !arch.entities.empty()) {
+                    size_t total = arch.entities.size();
+                    // Subdivide large archetypes into chunks for parallel processing
+                    const size_t chunk_size = 4096;  // Tune based on cache line size
+                    
+                    for (size_t start = 0; start < total; start += chunk_size) {
+                        size_t count = std::min(chunk_size, total - start);
+                        chunks.push_back({&arch, start, count});
+                    }
+                }
+            }
+        }
+        // Lock released - now safe to parallelize reads
+
+        // Process chunks in parallel
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
+            auto& work = chunks[chunk_idx];
+            fn(
+                (get_array<Cs>(*work.arch)->data() + work.start)...,
+                work.count
+            );
+        }
+    }
+
+    // --------------------------------------------------------
     // Query builder
     // --------------------------------------------------------
     template<typename... Cs>
@@ -398,17 +454,19 @@ public:
     // Batch operations
     // --------------------------------------------------------
     std::vector<Entity> create_batch(size_t count) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         std::vector<Entity> entities;
         entities.reserve(count);
         for (size_t i = 0; i < count; ++i) {
-            entities.push_back(create());
+            entities.push_back(create_unsafe());
         }
         return entities;
     }
 
     void destroy_batch(const std::vector<Entity>& entities) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         for (Entity e : entities) {
-            destroy(e);
+            destroy_unsafe(e);
         }
     }
 
@@ -417,6 +475,7 @@ public:
     // --------------------------------------------------------
     template<typename R, typename... Args>
     void set_resource(Args&&... args) {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         auto id = component_id<R>();
         auto& res = resources_[id];
         if (res.data && res.destroy) {
@@ -428,6 +487,7 @@ public:
 
     template<typename R>
     R& get_resource() {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         auto id = component_id<R>();
         auto it = resources_.find(id);
         assert(it != resources_.end() && it->second.data && "resource not found");
@@ -436,6 +496,7 @@ public:
 
     template<typename R>
     const R& get_resource() const {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         auto id = component_id<R>();
         auto it = resources_.find(id);
         assert(it != resources_.end() && it->second.data && "resource not found");
@@ -444,6 +505,7 @@ public:
 
     template<typename R>
     bool has_resource() const {
+        std::lock_guard<std::mutex> lock(world_mutex_);
         auto id = component_id<R>();
         auto it = resources_.find(id);
         return it != resources_.end() && it->second.data != nullptr;
@@ -513,6 +575,58 @@ private:
     // --------------------------------------------------------
     // Internal helpers
     // --------------------------------------------------------
+    
+    // Unsafe versions don't acquire locks (caller must hold world_mutex_)
+    bool alive_unsafe(Entity e) const {
+        return e.id < generations_.size() &&
+               generations_[e.id] == e.generation;
+    }
+
+    Entity create_unsafe() {
+        uint32_t id;
+        if (!free_ids_.empty()) {
+            id = free_ids_.back();
+            free_ids_.pop_back();
+        } else {
+            id = (uint32_t)generations_.size();
+            generations_.push_back(0);
+        }
+
+        Entity e{id, generations_[id]};
+        if (entity_locations_.size() <= id)
+            entity_locations_.resize(id + 1);
+        entity_locations_[id] = {nullptr, 0};
+        return e;
+    }
+
+    void destroy_unsafe(Entity e) {
+        if (!alive_unsafe(e)) return;
+
+        auto& loc = entity_locations_[e.id];
+        remove_from_archetype(e, *loc.arch, loc.index);
+
+        generations_[e.id]++;
+        free_ids_.push_back(e.id);
+    }
+
+    template<typename C>
+    C* get_unsafe(Entity e) {
+        if (!alive_unsafe(e)) return nullptr;
+        auto& loc = entity_locations_[e.id];
+        if (!loc.arch) return nullptr;
+        if (!loc.arch->key.has(component_id<C>())) return nullptr;
+        return &(*get_array<C>(*loc.arch))[loc.index];
+    }
+
+    template<typename C>
+    const C* get_unsafe(Entity e) const {
+        if (!alive_unsafe(e)) return nullptr;
+        auto& loc = entity_locations_[e.id];
+        if (!loc.arch) return nullptr;
+        if (!loc.arch->key.has(component_id<C>())) return nullptr;
+        return &(*get_array<C>(*loc.arch))[loc.index];
+    }
+
     template<typename C>
     std::vector<C>* get_array(Archetype& arch) {
         auto& arr = arch.components[component_id<C>()];
@@ -668,6 +782,8 @@ private:
     }
 
 private:
+    mutable std::mutex world_mutex_;  // Protects all World state
+    
     std::vector<uint32_t> generations_;
     std::vector<uint32_t> free_ids_;
 

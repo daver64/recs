@@ -38,6 +38,7 @@
 *.app
 recs_test
 examples
-
+threading_test
+openmp_test
 # debug information files
 *.dwo
