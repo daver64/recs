@@ -36,6 +36,8 @@
 *.exe
 *.out
 *.app
+recs_test
+examples
 
 # debug information files
 *.dwo
